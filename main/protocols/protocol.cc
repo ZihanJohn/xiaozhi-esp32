@@ -1,8 +1,63 @@
 #include "protocol.h"
 
+#include <algorithm>
+
 #include <esp_log.h>
 
 #define TAG "Protocol"
+
+bool Protocol::ActivateSession(const std::string& session_id) {
+    if (session_id.empty()) {
+        return false;
+    }
+    auto it = std::find(session_ids_.begin(), session_ids_.end(), session_id);
+    if (it == session_ids_.end()) {
+        return false;
+    }
+    session_id_ = session_id;
+    return true;
+}
+
+void Protocol::ReplaceSessionList(const std::vector<std::string>& sessions, const std::string& active_session_id) {
+    session_ids_ = sessions;
+    if (!active_session_id.empty() && ActivateSession(active_session_id)) {
+        return;
+    }
+    if (!session_ids_.empty()) {
+        session_id_ = session_ids_.front();
+    } else {
+        session_id_.clear();
+    }
+}
+
+void Protocol::RegisterOrUpdateSession(const std::string& session_id) {
+    if (session_id.empty()) {
+        return;
+    }
+    if (std::find(session_ids_.begin(), session_ids_.end(), session_id) == session_ids_.end()) {
+        session_ids_.push_back(session_id);
+    }
+    session_id_ = session_id;
+}
+
+void Protocol::RemoveSession(const std::string& session_id) {
+    if (session_id.empty()) {
+        return;
+    }
+    auto it = std::find(session_ids_.begin(), session_ids_.end(), session_id);
+    if (it == session_ids_.end()) {
+        return;
+    }
+    bool was_active = (session_id_ == session_id);
+    session_ids_.erase(it);
+    if (was_active) {
+        if (!session_ids_.empty()) {
+            session_id_ = session_ids_.front();
+        } else {
+            session_id_.clear();
+        }
+    }
+}
 
 void Protocol::OnIncomingJson(std::function<void(const cJSON* root)> callback) {
     on_incoming_json_ = callback;

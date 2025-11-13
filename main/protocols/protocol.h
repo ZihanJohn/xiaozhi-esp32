@@ -55,6 +55,12 @@ public:
         return session_id_;
     }
 
+    const std::vector<std::string>& session_ids() const {
+        return session_ids_;
+    }
+
+    bool ActivateSession(const std::string& session_id);
+
     void OnIncomingAudio(std::function<void(std::unique_ptr<AudioStreamPacket> packet)> callback);
     void OnIncomingJson(std::function<void(const cJSON* root)> callback);
     void OnAudioChannelOpened(std::function<void()> callback);
@@ -89,9 +95,16 @@ protected:
     std::string session_id_;
     std::chrono::time_point<std::chrono::steady_clock> last_incoming_time_;
 
+    void ReplaceSessionList(const std::vector<std::string>& sessions, const std::string& active_session_id);
+    void RegisterOrUpdateSession(const std::string& session_id);
+    void RemoveSession(const std::string& session_id);
+
     virtual bool SendText(const std::string& text) = 0;
     virtual void SetError(const std::string& message);
     virtual bool IsTimeout() const;
+
+private:
+    std::vector<std::string> session_ids_;
 };
 
 #endif // PROTOCOL_H
