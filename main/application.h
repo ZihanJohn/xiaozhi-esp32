@@ -63,6 +63,7 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    bool ActivateProtocolSession(const std::string& session_id);
 
 private:
     Application();

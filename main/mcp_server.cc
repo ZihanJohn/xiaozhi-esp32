@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "device_registry.h"
 
 #define TAG "MCP"
 
@@ -300,6 +301,49 @@ void McpServer::AddUserOnlyTools() {
                 return true;
             });
     }
+
+    AddUserOnlyTool("self.devices.sessions.list",
+        "List the sessions discovered via MQTT handshakes along with transport capabilities.",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            auto sessions = DeviceRegistry::GetInstance().GetSessions();
+            cJSON* array = cJSON_CreateArray();
+            for (const auto& session : sessions) {
+                cJSON* item = cJSON_CreateObject();
+                cJSON_AddStringToObject(item, "session_id", session.session_id.c_str());
+                if (!session.device_id.empty()) {
+                    cJSON_AddStringToObject(item, "device_id", session.device_id.c_str());
+                }
+                if (!session.label.empty()) {
+                    cJSON_AddStringToObject(item, "label", session.label.c_str());
+                }
+                if (!session.transport.empty()) {
+                    cJSON_AddStringToObject(item, "transport", session.transport.c_str());
+                }
+                cJSON_AddBoolToObject(item, "supports_udp", session.supports_udp);
+                cJSON_AddBoolToObject(item, "supports_mcp", session.supports_mcp);
+                cJSON_AddBoolToObject(item, "is_active", session.is_active);
+                cJSON_AddBoolToObject(item, "is_preferred", session.is_preferred);
+                cJSON_AddItemToArray(array, item);
+            }
+            return array;
+        });
+
+    AddUserOnlyTool("self.devices.sessions.set_preferred",
+        "Mark a session as preferred and attempt to activate it immediately.",
+        PropertyList({ Property("session_id", kPropertyTypeString) }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto session_id = properties["session_id"].value<std::string>();
+            auto& registry = DeviceRegistry::GetInstance();
+            if (!registry.SetPreferredSession(session_id)) {
+                throw std::runtime_error("Unknown session: " + session_id);
+            }
+            bool activated = Application::GetInstance().ActivateProtocolSession(session_id);
+            cJSON* result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result, "session_id", session_id.c_str());
+            cJSON_AddBoolToObject(result, "activated", activated);
+            return result;
+        });
 }
 
 void McpServer::AddTool(McpTool* tool) {

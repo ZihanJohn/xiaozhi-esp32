@@ -1,14 +1,32 @@
 #include "mqtt_protocol.h"
 #include "board.h"
 #include "application.h"
+#include "device_registry.h"
 #include "settings.h"
 
+#include <algorithm>
 #include <esp_log.h>
 #include <cstring>
 #include <arpa/inet.h>
 #include "assets/lang_config.h"
 
 #define TAG "MQTT"
+
+namespace {
+
+DeviceRegistry::SessionInfo ToSessionInfo(const MqttProtocol::SessionDescriptor& descriptor) {
+    DeviceRegistry::SessionInfo info;
+    info.session_id = descriptor.session_id;
+    info.device_id = descriptor.device_id;
+    info.label = descriptor.label;
+    info.transport = descriptor.transport;
+    info.supports_udp = descriptor.supports_udp;
+    info.supports_mcp = descriptor.supports_mcp;
+    info.is_active = descriptor.is_active;
+    return info;
+}
+
+} // namespace
 
 MqttProtocol::MqttProtocol() {
     event_group_handle_ = xEventGroupCreate();
@@ -108,7 +126,10 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s", session_id ? session_id->valuestring : "null");
-            if (session_id == nullptr || session_id_ == session_id->valuestring) {
+            if (session_id != nullptr && cJSON_IsString(session_id)) {
+                RemoveSessionDescriptor(session_id->valuestring);
+            }
+            if (session_id == nullptr || session_id_ == (session_id ? session_id->valuestring : "")) {
                 Application::GetInstance().Schedule([this]() {
                     CloseAudioChannel();
                 });
@@ -311,9 +332,11 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
 
     auto session_id = cJSON_GetObjectItem(root, "session_id");
     if (cJSON_IsString(session_id)) {
-        session_id_ = session_id->valuestring;
+        RegisterOrUpdateSession(session_id->valuestring);
         ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
     }
+
+    RegisterSessionsFromHello(root);
 
     // Get sample rate from hello message
     auto audio_params = cJSON_GetObjectItem(root, "audio_params");
@@ -346,6 +369,193 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
     local_sequence_ = 0;
     remote_sequence_ = 0;
     xEventGroupSetBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
+}
+
+void MqttProtocol::RegisterSessionsFromHello(const cJSON* root) {
+    std::vector<SessionDescriptor> descriptors;
+
+    auto add_descriptor = [&descriptors](const SessionDescriptor& descriptor) {
+        if (descriptor.session_id.empty()) {
+            return;
+        }
+        auto it = std::find_if(descriptors.begin(), descriptors.end(), [&](const SessionDescriptor& existing) {
+            return existing.session_id == descriptor.session_id;
+        });
+        if (it == descriptors.end()) {
+            descriptors.push_back(descriptor);
+        }
+    };
+
+    SessionDescriptor base_descriptor;
+    auto session_id = cJSON_GetObjectItem(root, "session_id");
+    if (cJSON_IsString(session_id)) {
+        base_descriptor.session_id = session_id->valuestring;
+    }
+    auto device_id = cJSON_GetObjectItem(root, "device_id");
+    if (cJSON_IsString(device_id)) {
+        base_descriptor.device_id = device_id->valuestring;
+    }
+    auto label = cJSON_GetObjectItem(root, "label");
+    if (cJSON_IsString(label)) {
+        base_descriptor.label = label->valuestring;
+    }
+    auto transport = cJSON_GetObjectItem(root, "transport");
+    if (cJSON_IsString(transport)) {
+        base_descriptor.transport = transport->valuestring;
+        base_descriptor.supports_udp = strcmp(transport->valuestring, "udp") == 0;
+    }
+    auto features = cJSON_GetObjectItem(root, "features");
+    if (cJSON_IsObject(features)) {
+        auto mcp = cJSON_GetObjectItem(features, "mcp");
+        if (cJSON_IsBool(mcp)) {
+            base_descriptor.supports_mcp = cJSON_IsTrue(mcp);
+        }
+    }
+    base_descriptor.is_active = true;
+    add_descriptor(base_descriptor);
+
+    auto sessions = cJSON_GetObjectItem(root, "sessions");
+    if (cJSON_IsArray(sessions)) {
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, sessions) {
+            if (!cJSON_IsObject(item)) {
+                continue;
+            }
+            SessionDescriptor descriptor;
+            auto id = cJSON_GetObjectItem(item, "session_id");
+            if (cJSON_IsString(id)) {
+                descriptor.session_id = id->valuestring;
+            }
+            auto dev = cJSON_GetObjectItem(item, "device_id");
+            if (cJSON_IsString(dev)) {
+                descriptor.device_id = dev->valuestring;
+            }
+            auto lbl = cJSON_GetObjectItem(item, "label");
+            if (cJSON_IsString(lbl)) {
+                descriptor.label = lbl->valuestring;
+            }
+            auto tr = cJSON_GetObjectItem(item, "transport");
+            if (cJSON_IsString(tr)) {
+                descriptor.transport = tr->valuestring;
+                descriptor.supports_udp = strcmp(tr->valuestring, "udp") == 0;
+            }
+            auto feats = cJSON_GetObjectItem(item, "features");
+            if (cJSON_IsObject(feats)) {
+                auto mcp = cJSON_GetObjectItem(feats, "mcp");
+                if (cJSON_IsBool(mcp)) {
+                    descriptor.supports_mcp = cJSON_IsTrue(mcp);
+                }
+            }
+            descriptor.is_active = (descriptor.session_id == base_descriptor.session_id);
+            add_descriptor(descriptor);
+        }
+    }
+
+    std::vector<std::string> session_ids;
+    session_ids.reserve(descriptors.size());
+    std::vector<DeviceRegistry::SessionInfo> session_infos;
+    session_infos.reserve(descriptors.size());
+    for (auto& descriptor : descriptors) {
+        session_ids.push_back(descriptor.session_id);
+        RegisterSessionDescriptor(descriptor);
+        session_infos.push_back(ToSessionInfo(descriptor));
+    }
+    std::string active_session = !descriptors.empty() ? descriptors.front().session_id : std::string();
+    ReplaceSessionList(session_ids, active_session);
+    SyncActiveDescriptor(session_id_);
+
+    DeviceRegistry::GetInstance().UpdateSessions(session_infos);
+}
+
+void MqttProtocol::RegisterSessionDescriptor(const SessionDescriptor& descriptor) {
+    if (descriptor.session_id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    if (descriptor.is_active) {
+        for (auto& [id, existing] : sessions_) {
+            existing.is_active = (id == descriptor.session_id);
+        }
+    }
+    sessions_[descriptor.session_id] = descriptor;
+}
+
+void MqttProtocol::RemoveSessionDescriptor(const std::string& session_id) {
+    if (session_id.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        auto it = sessions_.find(session_id);
+        if (it != sessions_.end()) {
+            sessions_.erase(it);
+        }
+    }
+    RemoveSession(session_id);
+    SyncActiveDescriptor(session_id_);
+
+    auto descriptors = GetSessionDescriptors();
+    std::vector<DeviceRegistry::SessionInfo> session_infos;
+    session_infos.reserve(descriptors.size());
+    for (auto& descriptor : descriptors) {
+        session_infos.push_back(ToSessionInfo(descriptor));
+    }
+    DeviceRegistry::GetInstance().UpdateSessions(session_infos);
+}
+
+std::vector<MqttProtocol::SessionDescriptor> MqttProtocol::GetSessionDescriptors() const {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    std::vector<SessionDescriptor> descriptors;
+    descriptors.reserve(sessions_.size());
+    for (const auto& [id, descriptor] : sessions_) {
+        SessionDescriptor copy = descriptor;
+        copy.is_active = (id == session_id_);
+        descriptors.push_back(copy);
+    }
+    std::sort(descriptors.begin(), descriptors.end(), [](const SessionDescriptor& lhs, const SessionDescriptor& rhs) {
+        return lhs.session_id < rhs.session_id;
+    });
+    return descriptors;
+}
+
+bool MqttProtocol::ActivateSessionById(const std::string& session_id) {
+    std::vector<SessionDescriptor> snapshot;
+    bool activated = false;
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            return false;
+        }
+        activated = ActivateSession(session_id);
+        if (activated) {
+            for (auto& [id, descriptor] : sessions_) {
+                descriptor.is_active = (id == session_id);
+            }
+            snapshot.reserve(sessions_.size());
+            for (const auto& [id, descriptor] : sessions_) {
+                SessionDescriptor copy = descriptor;
+                copy.is_active = (id == session_id_);
+                snapshot.push_back(copy);
+            }
+        }
+    }
+    if (activated) {
+        std::vector<DeviceRegistry::SessionInfo> session_infos;
+        session_infos.reserve(snapshot.size());
+        for (auto& descriptor : snapshot) {
+            session_infos.push_back(ToSessionInfo(descriptor));
+        }
+        DeviceRegistry::GetInstance().UpdateSessions(session_infos);
+    }
+    return activated;
+}
+
+void MqttProtocol::SyncActiveDescriptor(const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    for (auto& [id, descriptor] : sessions_) {
+        descriptor.is_active = (id == session_id);
+    }
 }
 
 static const char hex_chars[] = "0123456789ABCDEF";

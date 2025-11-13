@@ -892,3 +892,10 @@ void Application::SetAecMode(AecMode mode) {
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
 }
+
+bool Application::ActivateProtocolSession(const std::string& session_id) {
+    if (!protocol_) {
+        return false;
+    }
+    return protocol_->ActivateSessionById(session_id);
+}
